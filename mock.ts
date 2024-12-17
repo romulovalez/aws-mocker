@@ -13,10 +13,16 @@ import {
 	PutObjectCommandInput,
 	PutObjectCommandOutput,
 } from '@aws-sdk/client-s3';
-import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import {
+	CreateTableCommand,
+	CreateTableCommandInput,
+	CreateTableCommandOutput,
+	DynamoDBClient,
+	KeyType,
+} from '@aws-sdk/client-dynamodb';
 import { StreamingBlobPayloadOutputTypes } from '@smithy/types';
 import { DocumentClient } from 'aws-sdk/clients/dynamodb';
-import { PublishCommand, PublishCommandInput, PublishCommandOutput } from '@aws-sdk/client-sns';
+import { PublishCommandInput, PublishCommandOutput } from '@aws-sdk/client-sns';
 import {
 	ReceiveMessageCommandInput,
 	ReceiveMessageCommandOutput,
@@ -38,12 +44,46 @@ import { createHash, generateKeyPairSync, randomUUID, sign } from 'crypto';
  * MARK: memory storage
  */
 let tables: Record<string, Array<DocumentClient.AttributeMap>> = {};
+let tablesDefinitions: Record<string, { KeySchema: Record<string, KeyType> }> = {};
 let buckets: Record<string, Array<{ Key: string; Body: string }>> = {};
 let topics: Record<string, Array<PublishCommandInput>> = {};
 let queues: Record<string, Array<SendMessageBatchRequestEntry | SendMessageCommandInput>> = {};
 
+export function internal_DynamoDBPutCommand({ TableName, Item }: PutCommandInput): PutCommandOutput {
+	if (!TableName) throw new Error('TableName is required');
+	if (!Item) throw new Error('Item is required');
+	if (!tables[TableName]) throw new Error(`Table '${TableName}' not found, create it first with createTable()`);
+
+	const KeySchema = tablesDefinitions[TableName]?.KeySchema;
+	if (!KeySchema) throw new Error(`Table '${TableName}' not found, create it first with createTable()`);
+
+	const keys = Object.keys(KeySchema);
+	const indexFound = tables[TableName].findIndex((item) => keys.every((key) => item[key] === Item[key]));
+	if (indexFound === -1) {
+		tables[TableName].push(Item);
+	} else {
+		tables[TableName][indexFound] = Item;
+	}
+
+	return { $metadata: {} };
+}
+
+function validateTableKeySchema(TableName: string, Key: Record<string, any>) {
+	const KeySchema = tablesDefinitions[TableName]?.KeySchema;
+	if (!KeySchema) throw new Error(`Table '${TableName}' not found, create it first with createTable()`);
+
+	const keys = Object.keys(Key);
+	for (const key of keys) {
+		if (!KeySchema[key]) throw new Error(`Key '${key}' is not defined in table '${TableName}'`);
+	}
+}
+
+/**
+ * MARK: Helpers
+ */
 export function cleanTables() {
 	tables = {};
+	tablesDefinitions = {};
 }
 
 export function cleanBuckets() {
@@ -59,37 +99,60 @@ export function cleanQueues() {
 }
 
 export type Queues = typeof queues;
+
 export function subscribeToQueue(cb: (queuesRef: Queues) => void) {
 	cb(queues);
 }
 
-export function internal_DynamoDBPutCommand({ TableName, Item }: PutCommandInput) {
-	if (!TableName) throw new Error('TableName is required');
-	if (!Item) throw new Error('Item is required');
-
-	if (tables[TableName]) {
-		tables[TableName]!.push(Item);
-	} else {
-		tables[TableName] = [Item];
-	}
-}
-
-export function internal_getTopic(name: string) {
+export function getTopicMessages(name: string) {
 	return topics[name];
 }
 
-/**
- * Notes: For client.send() function we extend xxxxCommandOutput instead of the real xxxCommand just for practicity
- */
+export async function createTable(name: string, options: { primaryIndex: { hashKey: string; rangeKey?: string } }) {
+	const primaryIndex = Object.entries(options.primaryIndex);
+	await new DynamoDBClient().send(
+		new CreateTableCommand({
+			TableName: name,
+			AttributeDefinitions: [], // For now we don't need to define the attributes for mocking
+			KeySchema: primaryIndex.map(([type, name]) => ({
+				AttributeName: name,
+				KeyType: type === 'hashKey' ? 'HASH' : 'RANGE',
+			})),
+		}),
+	);
+}
 
 /**
  * MARK: DynamoDB mock
  */
 vi.mock('@aws-sdk/client-dynamodb', async () => ({
 	DynamoDBClient: class DynamoDBClient {
-		send: <T extends PutCommandOutput | GetCommandOutput>(command: { value: T }) => Promise<T> = async (command) => {
+		send: <T>(command: { value: T }) => Promise<T> = async (command) => {
 			return command.value;
 		};
+	},
+
+	/**
+	 * Need to create tables in mock to know the indexes to properly query the tables
+	 */
+	CreateTableCommand: class CreateTableCommand {
+		value: CreateTableCommandOutput;
+		constructor(command: CreateTableCommandInput) {
+			if (!command.TableName) throw new Error('TableName is required');
+			if (!command.KeySchema) throw new Error('KeySchema is required');
+
+			tables[command.TableName] = [];
+			tablesDefinitions[command.TableName] = { KeySchema: {} };
+
+			for (const key of command.KeySchema) {
+				if (key.KeyType == null) throw new Error('KeyType is required');
+				if (key.AttributeName == null) throw new Error('AttributeName is required');
+
+				tablesDefinitions[command.TableName]!.KeySchema[key.AttributeName] = key.KeyType;
+			}
+
+			this.value = { $metadata: {} };
+		}
 	},
 }));
 
@@ -99,37 +162,45 @@ vi.mock('@aws-sdk/lib-dynamodb', async () => ({
 			return client;
 		},
 	},
+
 	PutCommand: class PutCommand {
+		value: PutCommandOutput;
 		constructor(command: PutCommandInput) {
-			internal_DynamoDBPutCommand(command);
+			this.value = internal_DynamoDBPutCommand(command);
 		}
 	},
+
 	GetCommand: class GetCommand {
 		value: GetCommandOutput;
 		constructor({ TableName, Key }: GetCommandInput) {
 			if (!TableName) throw new Error('TableName is required');
 			if (!Key) throw new Error('Key is required');
 
+			validateTableKeySchema(TableName, Key);
+
 			const keys = Object.keys(Key);
-			const result = tables[TableName]?.find((item) => keys.every((key) => item[key] === Key![key]));
+			const result = tables[TableName]?.find((item) => keys.every((key) => item[key] === Key[key]));
 
 			this.value = { $metadata: {}, Item: result };
 		}
 	},
+
 	BatchGetCommand: class BatchGetCommand {
 		value: BatchGetCommandOutput;
 		constructor({ RequestItems }: BatchGetCommandInput) {
 			if (!RequestItems) throw new Error('RequestItems is required');
 
 			const TableName = Object.keys(RequestItems)[0]!;
-			const keys = RequestItems[TableName]?.Keys;
-			if (!keys) throw new Error('RequestItems Keys is required');
+			const Keys = RequestItems[TableName]?.Keys;
+			if (!Keys) throw new Error('RequestItems Keys is required');
 
 			const result =
 				tables[TableName]?.filter((item) =>
-					keys.some((key) => {
-						const subkeys = Object.keys(key);
-						return subkeys.every((subkey) => item[subkey] === key[subkey]);
+					Keys.some((Key) => {
+						validateTableKeySchema(TableName, Key);
+
+						const keys = Object.keys(Key);
+						return keys.every((subkey) => item[subkey] === Key[subkey]);
 					}),
 				) ?? [];
 
@@ -143,13 +214,13 @@ vi.mock('@aws-sdk/lib-dynamodb', async () => ({
  */
 vi.mock('@aws-sdk/client-s3', async () => ({
 	S3Client: class S3Client {
-		send: <T extends PutObjectCommandOutput | GetObjectCommandOutput>(command: { value: T }) => Promise<T> = async (
-			command,
-		) => {
+		send: <T>(command: { value: T }) => Promise<T> = async (command) => {
 			return command.value;
 		};
 	},
+
 	PutObjectCommand: class PutObjectCommand {
+		value: PutObjectCommandOutput;
 		constructor({ Bucket, Key, Body }: PutObjectCommandInput) {
 			if (!Bucket) throw new Error('Bucket is required');
 			if (!Key) throw new Error('Key is required');
@@ -157,13 +228,21 @@ vi.mock('@aws-sdk/client-s3', async () => ({
 
 			const file = { Key, Body: Body as string };
 
-			if (buckets[Bucket]) {
-				buckets[Bucket]!.push(file);
-			} else {
+			if (!buckets[Bucket]) {
 				buckets[Bucket] = [file];
+			} else {
+				const indexFound = buckets[Bucket].findIndex((item) => item.Key === Key);
+				if (indexFound === -1) {
+					buckets[Bucket].push(file);
+				} else {
+					buckets[Bucket][indexFound] = file;
+				}
 			}
+
+			this.value = { $metadata: {} };
 		}
 	},
+
 	GetObjectCommand: class GetObjectCommand {
 		value: GetObjectCommandOutput;
 		constructor({ Bucket, Key }: GetObjectCommandInput) {
@@ -192,10 +271,11 @@ vi.mock('@aws-sdk/client-s3', async () => ({
  */
 vi.mock('@aws-sdk/client-sns', async () => ({
 	SNSClient: class SNSClient {
-		send: <T extends PublishCommand>(command: { value: T }) => Promise<T> = async (command) => {
+		send: <T>(command: { value: T }) => Promise<T> = async (command) => {
 			return command.value;
 		};
 	},
+
 	PublishCommand: class PublishCommand {
 		value: PublishCommandOutput;
 		constructor(input: PublishCommandInput) {
@@ -221,10 +301,11 @@ vi.mock('@aws-sdk/client-sns', async () => ({
  */
 vi.mock('@aws-sdk/client-sqs', async () => ({
 	SQSClient: class SQSClient {
-		send: <T extends SendMessageBatchCommandOutput>(command: { value: T }) => Promise<T> = async (command) => {
+		send: <T>(command: { value: T }) => Promise<T> = async (command) => {
 			return command.value;
 		};
 	},
+
 	SendMessageBatchCommand: class SendMessageBatchCommand {
 		value: SendMessageBatchCommandOutput;
 		constructor(input: SendMessageBatchCommandInput) {
@@ -248,6 +329,7 @@ vi.mock('@aws-sdk/client-sqs', async () => ({
 			};
 		}
 	},
+
 	SendMessageCommand: class SendMessageCommand {
 		value: SendMessageCommandOutput;
 		constructor(input: SendMessageCommandInput) {
@@ -266,6 +348,7 @@ vi.mock('@aws-sdk/client-sqs', async () => ({
 			};
 		}
 	},
+
 	ReceiveMessageCommand: class ReceiveMessageCommand {
 		value: ReceiveMessageCommandOutput;
 		constructor(input: ReceiveMessageCommandInput) {
@@ -296,10 +379,11 @@ const { privateKey, publicKey } = generateKeyPairSync('rsa', {
 
 vi.mock('@aws-sdk/client-kms', async () => ({
 	KMSClient: class KMSClient {
-		send: <T extends SignCommandOutput>(command: { value: T }) => Promise<T> = async (command) => {
+		send: <T>(command: { value: T }) => Promise<T> = async (command) => {
 			return command.value;
 		};
 	},
+
 	SignCommand: class SignCommand {
 		value: SignCommandOutput;
 		constructor({ KeyId, Message }: SignCommandInput) {
@@ -312,6 +396,7 @@ vi.mock('@aws-sdk/client-kms', async () => ({
 			};
 		}
 	},
+
 	GetPublicKeyCommand: class GetPublicKeyCommand {
 		value: GetPublicKeyCommandOutput;
 		constructor({ KeyId }: GetPublicKeyCommandInput) {

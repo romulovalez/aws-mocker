@@ -1,37 +1,38 @@
 {
-  "name": "aws-mocker",
-  "version": "1.0.0",
-  "description": "AWS mock library that creates aws resources in-memory",
-  "main": "mock.ts",
-  "scripts": {
-    "test": "vitest --coverage"
-  },
-  "keywords": [
-    "aws-sdk",
-    "mock",
-    "dynamodb",
-    "s3",
-    "sns",
-    "sqs",
-    "memory"
-  ],
-  "author": "romulovalez@gmail.com",
-  "license": "ISC",
-  "packageManager": "pnpm@9.14.4+sha512.c8180b3fbe4e4bca02c94234717896b5529740a6cbadf19fa78254270403ea2f27d4e1d46a08a0f56c89b63dc8ebfd3ee53326da720273794e6200fcf0d184ab",
-  "devDependencies": {
-    "@aws-sdk/client-dynamodb": "^3.712.0",
-    "@aws-sdk/client-kms": "^3.712.0",
-    "@aws-sdk/client-s3": "^3.712.0",
-    "@aws-sdk/client-sns": "^3.712.0",
-    "@aws-sdk/client-sqs": "^3.712.0",
-    "@aws-sdk/lib-dynamodb": "^3.712.0",
-    "@smithy/types": "^3.7.2",
-    "@types/jsonwebtoken": "^9.0.7",
-    "@types/node": "^22.10.2",
-    "@vitest/coverage-v8": "2.1.8",
-    "aws-sdk": "^2.1692.0",
-    "base64url": "^3.0.1",
-    "jsonwebtoken": "^9.0.2",
-    "vitest": "^2.1.8"
-  }
+	"name": "aws-mocker",
+	"version": "1.0.1",
+	"description": "AWS mock library that creates aws resources in-memory",
+	"main": "mock.ts",
+	"scripts": {
+		"test": "vitest --coverage"
+	},
+	"keywords": [
+		"aws-sdk",
+		"mock",
+		"dynamodb",
+		"s3",
+		"sns",
+		"sqs",
+		"memory"
+	],
+	"author": "romulovalez@gmail.com",
+	"license": "ISC",
+	"packageManager": "pnpm@9.14.4+sha512.c8180b3fbe4e4bca02c94234717896b5529740a6cbadf19fa78254270403ea2f27d4e1d46a08a0f56c89b63dc8ebfd3ee53326da720273794e6200fcf0d184ab",
+	"devDependencies": {
+		"@aws-sdk/client-dynamodb": "^3.712.0",
+		"@aws-sdk/client-kms": "^3.712.0",
+		"@aws-sdk/client-s3": "^3.712.0",
+		"@aws-sdk/client-sns": "^3.712.0",
+		"@aws-sdk/client-sqs": "^3.712.0",
+		"@aws-sdk/lib-dynamodb": "^3.712.0",
+		"@smithy/types": "^3.7.2",
+		"@types/jsonwebtoken": "^9.0.7",
+		"@types/node": "^22.10.2",
+		"@vitest/coverage-v8": "2.1.8",
+		"aws-sdk": "^2.1692.0",
+		"base64url": "^3.0.1",
+		"jsonwebtoken": "^9.0.2",
+		"prettier": "^3.4.2",
+		"vitest": "^2.1.8"
+	}
 }
