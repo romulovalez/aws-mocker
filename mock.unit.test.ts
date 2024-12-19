@@ -1,8 +1,8 @@
-import { cleanBuckets, cleanTopics, cleanQueues, getTopicMessages, createTable, cleanTables } from './mock';
-import { beforeAll, beforeEach, describe, expect, test } from 'vitest';
+import { cleanResources, getTopicMessages, createTable } from './mock';
+import { beforeEach, describe, expect, test } from 'vitest';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { PutCommand, GetCommand, BatchGetCommand } from '@aws-sdk/lib-dynamodb';
-import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { PutCommand, GetCommand, BatchGetCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
+import { CopyObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { GetPublicKeyCommand, KMSClient, SignCommand } from '@aws-sdk/client-kms';
 import { SNSClient, PublishCommand } from '@aws-sdk/client-sns';
 import { SQSClient, SendMessageCommand, ReceiveMessageCommand } from '@aws-sdk/client-sqs';
@@ -16,9 +16,9 @@ const sqsClient = new SQSClient();
 const kmsClient = new KMSClient();
 
 describe('DynamoDB', () => {
-	beforeEach(async () => {
-		cleanTables();
-		await createTable('TableName', { primaryIndex: { hashKey: 'pk', rangeKey: 'sk' } });
+	beforeEach(() => {
+		cleanResources();
+		createTable('TableName', { primaryIndex: { hashKey: 'pk', rangeKey: 'sk' } });
 	});
 
 	test('PutCommand && GetCommand', async () => {
@@ -102,11 +102,85 @@ describe('DynamoDB', () => {
 			['TableName']: [{ pk: 'item1', sk: 'sk', foo: 'bar' }],
 		});
 	});
+
+	describe('QueryCommand', () => {
+		beforeEach(() => {
+			cleanResources();
+			createTable('TableName', { primaryIndex: { hashKey: 'pk', rangeKey: 'sk' } });
+
+			client.send(
+				new PutCommand({
+					TableName: 'TableName',
+					Item: { pk: 'item1', sk: 'sk1', merchantId: 'merchant1', confirmedAt: 1620000000 },
+				}),
+			);
+
+			client.send(
+				new PutCommand({
+					TableName: 'TableName',
+					Item: { pk: 'item1', sk: 'sk2', merchantId: 'merchant1', confirmedAt: 1625000000 },
+				}),
+			);
+		});
+
+		test('QueryCommand: simple case', async () => {
+			const multipleResults = await client.send(
+				new QueryCommand({
+					TableName: 'TableName',
+					KeyConditionExpression: 'pk = :pk',
+					ExpressionAttributeValues: {
+						':pk': 'item1',
+					},
+				}),
+			);
+
+			expect(multipleResults.Items).toStrictEqual([
+				{ pk: 'item1', sk: 'sk1', merchantId: 'merchant1', confirmedAt: 1620000000 },
+				{ pk: 'item1', sk: 'sk2', merchantId: 'merchant1', confirmedAt: 1625000000 },
+			]);
+
+			const singleFilteredResult = await client.send(
+				new QueryCommand({
+					TableName: 'TableName',
+					KeyConditionExpression: 'sk = :sk',
+					ExpressionAttributeValues: {
+						':sk': 'sk2',
+					},
+				}),
+			);
+
+			expect(singleFilteredResult.Items).toStrictEqual([
+				{ pk: 'item1', sk: 'sk2', merchantId: 'merchant1', confirmedAt: 1625000000 },
+			]);
+		});
+
+		test('QueryCommand: and / between cases', async () => {
+			const queryResultWithCondition = await client.send(
+				new QueryCommand({
+					TableName: 'TableName',
+					KeyConditionExpression: '#merchantId = :merchantId and #confirmedAt between :from and :to',
+					ExpressionAttributeNames: {
+						'#merchantId': 'merchantId',
+						'#confirmedAt': 'confirmedAt',
+					},
+					ExpressionAttributeValues: {
+						':merchantId': 'merchant1',
+						':from': 1610000000,
+						':to': 1620000000,
+					},
+				}),
+			);
+
+			expect(queryResultWithCondition.Items).toStrictEqual([
+				{ pk: 'item1', sk: 'sk1', merchantId: 'merchant1', confirmedAt: 1620000000 },
+			]);
+		});
+	});
 });
 
 describe('S3', () => {
 	beforeEach(() => {
-		cleanBuckets();
+		cleanResources();
 	});
 
 	test('PutObjectCommand && GetObjectCommand', async () => {
@@ -132,11 +206,34 @@ describe('S3', () => {
 		const overridedFile = await s3Client.send(new GetObjectCommand({ Bucket: 'BucketName', Key: 'file.txt' }));
 		expect(await overridedFile.Body?.transformToString()).toStrictEqual('overrided text!\n');
 	});
+
+	test('CopyObjectCommand', async () => {
+		await s3Client.send(
+			new PutObjectCommand({
+				Bucket: 'SourceBucket',
+				Key: 'sourceFile.txt',
+				Body: 'source text\n',
+			}),
+		);
+
+		await s3Client.send(
+			new CopyObjectCommand({
+				Bucket: 'DestinationBucket',
+				CopySource: 'SourceBucket/sourceFile.txt',
+				Key: 'destinationFile.txt',
+			}),
+		);
+
+		const copiedFile = await s3Client.send(
+			new GetObjectCommand({ Bucket: 'DestinationBucket', Key: 'destinationFile.txt' }),
+		);
+		expect(await copiedFile.Body?.transformToString()).toStrictEqual('source text\n');
+	});
 });
 
 describe('SNS', () => {
 	beforeEach(() => {
-		cleanTopics();
+		cleanResources();
 	});
 
 	test('PublishCommand & check if message gets to topic', async () => {
@@ -152,18 +249,13 @@ describe('SNS', () => {
 		expect(publishResult.MessageId).toBeDefined();
 
 		const topicMessages = getTopicMessages('TopicArn');
-		expect(topicMessages).toStrictEqual([
-			{
-				TopicArn: 'TopicArn',
-				Message: JSON.stringify(message),
-			},
-		]);
+		expect(topicMessages).toStrictEqual([message]);
 	});
 });
 
 describe('SQS', () => {
-	beforeAll(() => {
-		cleanQueues();
+	beforeEach(() => {
+		cleanResources();
 	});
 
 	test('SendMessageCommand && ReceiveMessageCommand', async () => {
