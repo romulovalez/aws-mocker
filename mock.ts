@@ -1,5 +1,12 @@
 import { vi } from 'vitest';
 import {
+	DynamoDBClient,
+	CreateTableCommand,
+	type CreateTableCommandInput,
+	type CreateTableCommandOutput,
+	type KeyType,
+} from '@aws-sdk/client-dynamodb';
+import type {
 	BatchGetCommandInput,
 	BatchGetCommandOutput,
 	BatchWriteCommandInput,
@@ -14,7 +21,8 @@ import {
 	ScanCommandInput,
 	ScanCommandOutput,
 } from '@aws-sdk/lib-dynamodb';
-import {
+import type {
+	S3Client,
 	CopyObjectCommandInput,
 	CopyObjectCommandOutput,
 	GetObjectCommandInput,
@@ -22,21 +30,16 @@ import {
 	PutObjectCommandInput,
 	PutObjectCommandOutput,
 } from '@aws-sdk/client-s3';
-import {
-	CreateTableCommand,
-	CreateTableCommandInput,
-	CreateTableCommandOutput,
-	DynamoDBClient,
-	KeyType,
-} from '@aws-sdk/client-dynamodb';
-import { StreamingBlobPayloadOutputTypes } from '@smithy/types';
-import {
+import type { StreamingBlobPayloadOutputTypes } from '@smithy/types';
+import type {
+	SNSClient,
 	PublishBatchCommandInput,
 	PublishBatchCommandOutput,
 	PublishCommandInput,
 	PublishCommandOutput,
 } from '@aws-sdk/client-sns';
-import {
+import type {
+	SQSClient,
 	ReceiveMessageCommandInput,
 	ReceiveMessageCommandOutput,
 	SendMessageBatchCommandInput,
@@ -45,7 +48,8 @@ import {
 	SendMessageCommandInput,
 	SendMessageCommandOutput,
 } from '@aws-sdk/client-sqs';
-import {
+import type {
+	KMSClient,
 	GetPublicKeyCommandInput,
 	GetPublicKeyCommandOutput,
 	SignCommandInput,
@@ -107,7 +111,7 @@ function validateTableKeySchema(TableName: string, Key: Record<string, string | 
 /**
  * MARK: Helpers
  */
-export function cleanResources() {
+export function clearResources() {
 	for (const table in tables) {
 		tables[table] = [];
 	}
@@ -151,13 +155,7 @@ export function getQueueMessages(queueUrl: string) {
 	return queues[queueUrl]?.map((m) => JSON.parse(m.MessageBody!)) ?? [];
 }
 
-export async function createTable(
-	name: string,
-	options: {
-		primaryIndex: { hashKey: string; rangeKey?: string };
-		globalIndexes?: Record<string, { hashKey: string; rangeKey?: string; projection?: 'all' | 'keys-only' | string[] }>;
-	},
-) {
+export async function createTable(name: string, options: { primaryIndex: { hashKey: string; rangeKey?: string } }) {
 	const primaryIndex = Object.entries(options.primaryIndex);
 	await new DynamoDBClient().send(
 		new CreateTableCommand({
@@ -168,19 +166,6 @@ export async function createTable(
 				AttributeName: name,
 				KeyType: type === 'hashKey' ? 'HASH' : 'RANGE',
 			})),
-			GlobalSecondaryIndexes: Object.entries(options.globalIndexes ?? {}).map(([indexName, index]) => ({
-				IndexName: indexName,
-				KeySchema: index.rangeKey
-					? [
-							{ AttributeName: index.hashKey, KeyType: 'HASH' },
-							{ AttributeName: index.rangeKey, KeyType: 'RANGE' },
-						]
-					: [{ AttributeName: index.hashKey, KeyType: 'HASH' }],
-				Projection: {
-					// For now we don't need to define the specific items projected, we will return always all for mocking
-					ProjectionType: index.projection === 'keys-only' ? 'KEYS_ONLY' : 'ALL',
-				},
-			})),
 		}),
 	);
 }
@@ -189,17 +174,15 @@ export async function createTable(
  * MARK: DynamoDB mock
  */
 vi.mock('@aws-sdk/client-dynamodb', () => ({
-	DynamoDBClient: class DynamoDBClient {
-		send: <T>(command: { value: T }) => Promise<T> = async (command) => {
-			return command.value;
-		};
+	DynamoDBClient: class {
+		send: DynamoDBClient['send'] = async (command) => command.input;
 	},
 
 	/**
-	 * Need to create tables in mock to know the indexes to properly query the tables
+	 * We need to create tables to know the indexes to properly update the items
 	 */
-	CreateTableCommand: class CreateTableCommand {
-		value: CreateTableCommandOutput;
+	CreateTableCommand: class {
+		input: CreateTableCommandOutput;
 		constructor(command: CreateTableCommandInput) {
 			if (!command.TableName) throw new Error('TableName is required');
 			if (!command.KeySchema) throw new Error('KeySchema is required');
@@ -214,7 +197,7 @@ vi.mock('@aws-sdk/client-dynamodb', () => ({
 				tablesDefinitions[command.TableName]!.KeySchema[key.AttributeName] = key.KeyType;
 			}
 
-			this.value = { $metadata: {} };
+			this.input = { $metadata: {} };
 		}
 	},
 }));
@@ -226,15 +209,15 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
 		},
 	},
 
-	PutCommand: class PutCommand {
-		value: PutCommandOutput;
+	PutCommand: class {
+		input: PutCommandOutput;
 		constructor(command: PutCommandInput) {
-			this.value = internal_DynamoDBPutCommand(command);
+			this.input = internal_DynamoDBPutCommand(command);
 		}
 	},
 
-	GetCommand: class GetCommand {
-		value: GetCommandOutput;
+	GetCommand: class {
+		input: GetCommandOutput;
 		constructor({ TableName, Key }: GetCommandInput) {
 			if (!TableName) throw new Error('TableName is required');
 			if (!Key) throw new Error('Key is required');
@@ -244,12 +227,12 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
 			const keys = Object.keys(Key);
 			const result = tables[TableName]?.find((item) => keys.every((key) => item[key] === Key[key]));
 
-			this.value = { $metadata: {}, Item: result };
+			this.input = { $metadata: {}, Item: result };
 		}
 	},
 
-	BatchGetCommand: class BatchGetCommand {
-		value: BatchGetCommandOutput;
+	BatchGetCommand: class {
+		input: BatchGetCommandOutput;
 		constructor({ RequestItems }: BatchGetCommandInput) {
 			if (!RequestItems) throw new Error('RequestItems is required');
 
@@ -267,12 +250,12 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
 					}),
 				) ?? [];
 
-			this.value = { $metadata: {}, Responses: { [TableName]: result } };
+			this.input = { $metadata: {}, Responses: { [TableName]: result } };
 		}
 	},
 
-	BatchWriteCommand: class BatchWriteCommand {
-		value: BatchWriteCommandOutput;
+	BatchWriteCommand: class {
+		input: BatchWriteCommandOutput;
 		constructor({ RequestItems }: BatchWriteCommandInput) {
 			if (!RequestItems) throw new Error('RequestItems is required');
 
@@ -282,118 +265,75 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
 
 			Items.forEach((Item) => internal_DynamoDBPutCommand({ TableName, Item }));
 
-			this.value = { $metadata: {} };
+			this.input = { $metadata: {} };
 		}
 	},
 
-	QueryCommand: class QueryCommand {
-		value: QueryCommandOutput;
-		constructor({
-			TableName,
-			KeyConditionExpression,
-			ExpressionAttributeNames,
-			ExpressionAttributeValues,
-			Select,
-		}: QueryCommandInput) {
-			if (!TableName) throw new Error('TableName is required');
-			if (!KeyConditionExpression) throw new Error('KeyConditionExpression is required');
+	QueryCommand: class {
+		input: QueryCommandOutput;
+		constructor(input: QueryCommandInput) {
+			if (!input.TableName) throw new Error('TableName is required');
+			if (!input.KeyConditionExpression) throw new Error('KeyConditionExpression is required');
 
 			/**
-			 * Parse KeyConditionExpression that can have this structure:
+			 * This are the possible values for KeyConditionExpression:
 			 * a) #pk = :pk
-			 * b) #merchantId = :merchantId and #confirmedAt between :from and :to
+			 * c) #pk = :pk and #sk = :sk
+			 * d) #pk = :pk and #sk <= :sk
+			 * e) #pk = :pk and #sk >= :sk
+			 * f) #pk = :pk and #sk between :from and :to
 			 */
-			const splitConditions = (expression: string) => {
-				const conditions: string[] = [];
-				let buffer = '';
-				let inBetween = false;
+			const [firstCondition, ...secondConditionSplitted] = input.KeyConditionExpression.split(' and ');
+			const secondCondition = secondConditionSplitted.join(' and ');
 
-				for (let i = 0; i < expression.length; i++) {
-					const char = expression[i];
-					const nextChars = expression.slice(i, i + 5).toLowerCase();
-
-					if (nextChars === ' and ' && !inBetween) {
-						conditions.push(buffer.trim());
-						buffer = '';
-						i += 4;
-					} else {
-						if (char === ' ' && buffer.endsWith('between')) {
-							inBetween = true;
-						} else if (char === ' ' && buffer.endsWith('and') && inBetween) {
-							inBetween = false;
-						}
-						buffer += char;
-					}
-				}
-				if (buffer) conditions.push(buffer.trim());
-
-				return conditions;
-			};
-
-			type Conditions = {
+			const conditions: {
 				attributeName: string;
-				operator: '=' | 'between';
-				attributeValue: NativeAttributeValue | [NativeAttributeValue, NativeAttributeValue];
-			};
-			const conditions: Conditions[] = [];
+				operator: string | undefined;
+				attributeValue: NativeAttributeValue;
+			}[] = [];
 
-			for (const condition of splitConditions(KeyConditionExpression)) {
-				const [key, operator, value, _optionalBetweenAnd, optionalBetweenValue] = condition
-					.replace('=', ' = ')
-					.replaceAll('  ', ' ')
-					.replace(' BETWEEN ', ' between ')
-					.replaceAll(' AND ', ' and ')
-					.split(' ');
+			for (const condition of [firstCondition, secondCondition]) {
+				if (!condition) continue;
+				const [key, operator, firstValue, _and, secondValue] = condition.split(' ');
 
-				if (!key || !operator || !value) throw new Error(`Invalid KeyConditionExpression: '${condition}'`);
-
-				const attributeName = key.startsWith('#') ? ExpressionAttributeNames?.[key] : key;
+				const attributeName = key!.startsWith('#') ? input.ExpressionAttributeNames?.[key!] : key;
 				if (!attributeName) throw new Error(`Attribute '${key}' not found in ExpressionAttributeNames`);
 
-				if (!['=', 'between'].includes(operator)) throw new Error(`Unsupported operator: ${operator}`);
-
 				const attributeValue =
-					operator === 'between' && optionalBetweenValue
-						? [value, optionalBetweenValue].map((eachValue) => {
-								const eachValueTrimmed = eachValue.trim();
-								if (!ExpressionAttributeValues?.[eachValueTrimmed])
-									throw new Error(`Attribute '${eachValueTrimmed}' not found in ExpressionAttributeValues`);
-								return ExpressionAttributeValues[eachValueTrimmed];
-							})
-						: ExpressionAttributeValues?.[value];
+					operator === 'between' && secondValue
+						? [firstValue, secondValue].map((value) => input.ExpressionAttributeValues?.[value!])
+						: input.ExpressionAttributeValues?.[firstValue!];
 
-				conditions.push({ attributeName, operator: operator as Conditions['operator'], attributeValue });
+				conditions.push({ attributeName, operator, attributeValue });
 			}
 
-			const result = tables[TableName]?.filter((item) =>
+			const result = tables[input.TableName]?.filter((item) =>
 				conditions.every(({ attributeName, operator, attributeValue }) => {
-					if (operator === '=') {
-						return item[attributeName] === attributeValue;
-					}
-
+					if (operator === '=') return item[attributeName] === attributeValue;
+					if (operator === '<=') return item[attributeName] <= attributeValue;
+					if (operator === '>=') return item[attributeName] >= attributeValue;
 					if (operator === 'between') {
-						const [low, high] = attributeValue as [NativeAttributeValue, NativeAttributeValue];
-						return item[attributeName] >= low && item[attributeName] <= high;
+						const [firstValue, secondValue] = attributeValue as [NativeAttributeValue, NativeAttributeValue];
+						return item[attributeName] >= firstValue && item[attributeName] <= secondValue;
 					}
-
 					throw new Error(`Unsupported operator: ${operator}`);
 				}),
 			);
 
-			this.value = {
+			this.input = {
 				$metadata: {},
 				Items: result ?? [],
-				Count: Select === 'COUNT' ? (result?.length ?? 0) : undefined,
+				Count: input.Select === 'COUNT' ? (result?.length ?? 0) : undefined,
 			};
 		}
 	},
 
-	ScanCommand: class ScanCommand {
-		value: ScanCommandOutput;
+	ScanCommand: class {
+		input: ScanCommandOutput;
 		constructor({ TableName }: ScanCommandInput) {
 			if (!TableName) throw new Error('TableName is required');
 
-			this.value = {
+			this.input = {
 				$metadata: {},
 				Items: tables[TableName] ?? [],
 			};
@@ -405,14 +345,12 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
  * MARK: S3 mock
  */
 vi.mock('@aws-sdk/client-s3', () => ({
-	S3Client: class S3Client {
-		send: <T>(command: { value: T }) => Promise<T> = async (command) => {
-			return command.value;
-		};
+	S3Client: class {
+		send: S3Client['send'] = async (command) => command.input;
 	},
 
-	PutObjectCommand: class PutObjectCommand {
-		value: PutObjectCommandOutput;
+	PutObjectCommand: class {
+		input: PutObjectCommandOutput;
 		constructor({ Bucket, Key, Body }: PutObjectCommandInput) {
 			if (!Bucket) throw new Error('Bucket is required');
 			if (!Key) throw new Error('Key is required');
@@ -431,12 +369,12 @@ vi.mock('@aws-sdk/client-s3', () => ({
 				}
 			}
 
-			this.value = { $metadata: {} };
+			this.input = { $metadata: {} };
 		}
 	},
 
-	GetObjectCommand: class GetObjectCommand {
-		value: GetObjectCommandOutput;
+	GetObjectCommand: class {
+		input: GetObjectCommandOutput;
 		constructor({ Bucket, Key }: GetObjectCommandInput) {
 			if (!Bucket) throw new Error('Bucket is required');
 			if (!Key) throw new Error('Key is required');
@@ -445,7 +383,7 @@ vi.mock('@aws-sdk/client-s3', () => ({
 
 			if (!file) throw new Error(`UNEXPECTED_FILE_FORMAT`);
 
-			this.value = {
+			this.input = {
 				$metadata: {},
 				Body: {
 					transformToByteArray: async (): Promise<Uint8Array> => Buffer.from(file.Body),
@@ -457,8 +395,8 @@ vi.mock('@aws-sdk/client-s3', () => ({
 		}
 	},
 
-	CopyObjectCommand: class CopyObjectCommand {
-		value: CopyObjectCommandOutput;
+	CopyObjectCommand: class {
+		input: CopyObjectCommandOutput;
 		constructor({ Bucket, Key, CopySource }: CopyObjectCommandInput) {
 			if (!Bucket) throw new Error('Bucket is required');
 			if (!Key) throw new Error('Key is required');
@@ -483,7 +421,7 @@ vi.mock('@aws-sdk/client-s3', () => ({
 				}
 			}
 
-			this.value = { $metadata: {} };
+			this.input = { $metadata: {} };
 		}
 	},
 }));
@@ -492,14 +430,12 @@ vi.mock('@aws-sdk/client-s3', () => ({
  * MARK: SNS mock
  */
 vi.mock('@aws-sdk/client-sns', () => ({
-	SNSClient: class SNSClient {
-		send: <T>(command: { value: T }) => Promise<T> = async (command) => {
-			return command.value;
-		};
+	SNSClient: class {
+		send: SNSClient['send'] = async (command) => command.input;
 	},
 
-	PublishCommand: class PublishCommand {
-		value: PublishCommandOutput;
+	PublishCommand: class {
+		input: PublishCommandOutput;
 		constructor(input: PublishCommandInput) {
 			if (!input.Message) throw new Error('Message is required');
 			if (!input.TopicArn) throw new Error('TopicArn is required');
@@ -510,15 +446,15 @@ vi.mock('@aws-sdk/client-sns', () => ({
 				topics[input.TopicArn] = [input];
 			}
 
-			this.value = {
+			this.input = {
 				$metadata: {},
 				MessageId: randomUUID(),
 			};
 		}
 	},
 
-	PublishBatchCommand: class PublishBatchCommand {
-		value: PublishBatchCommandOutput;
+	PublishBatchCommand: class {
+		input: PublishBatchCommandOutput;
 		constructor({ TopicArn, PublishBatchRequestEntries }: PublishBatchCommandInput) {
 			if (!TopicArn) throw new Error('TopicArn is required');
 			if (!PublishBatchRequestEntries) throw new Error('PublishBatchRequestEntries is required');
@@ -529,7 +465,7 @@ vi.mock('@aws-sdk/client-sns', () => ({
 				topics[TopicArn] = PublishBatchRequestEntries;
 			}
 
-			this.value = {
+			this.input = {
 				$metadata: {},
 				Successful: PublishBatchRequestEntries.map((entry) => ({
 					Id: entry.Id,
@@ -544,14 +480,12 @@ vi.mock('@aws-sdk/client-sns', () => ({
  * MARK: SQS mock
  */
 vi.mock('@aws-sdk/client-sqs', () => ({
-	SQSClient: class SQSClient {
-		send: <T>(command: { value: T }) => Promise<T> = async (command) => {
-			return command.value;
-		};
+	SQSClient: class {
+		send: SQSClient['send'] = async (command) => command.input;
 	},
 
-	SendMessageBatchCommand: class SendMessageBatchCommand {
-		value: SendMessageBatchCommandOutput;
+	SendMessageBatchCommand: class {
+		input: SendMessageBatchCommandOutput;
 		constructor(input: SendMessageBatchCommandInput) {
 			if (!input.QueueUrl) throw new Error('QueueUrl is required');
 			if (!input.Entries) throw new Error('Entries is required');
@@ -562,7 +496,7 @@ vi.mock('@aws-sdk/client-sqs', () => ({
 				queues[input.QueueUrl] = input.Entries;
 			}
 
-			this.value = {
+			this.input = {
 				$metadata: {},
 				Failed: [],
 				Successful: input.Entries.map((entry) => ({
@@ -574,8 +508,8 @@ vi.mock('@aws-sdk/client-sqs', () => ({
 		}
 	},
 
-	SendMessageCommand: class SendMessageCommand {
-		value: SendMessageCommandOutput;
+	SendMessageCommand: class {
+		input: SendMessageCommandOutput;
 		constructor(input: SendMessageCommandInput) {
 			if (!input.QueueUrl) throw new Error('QueueUrl is required');
 			if (!input.MessageBody) throw new Error('MessageBody is required');
@@ -586,19 +520,19 @@ vi.mock('@aws-sdk/client-sqs', () => ({
 				queues[input.QueueUrl] = [input];
 			}
 
-			this.value = {
+			this.input = {
 				$metadata: {},
 				MessageId: randomUUID(),
 			};
 		}
 	},
 
-	ReceiveMessageCommand: class ReceiveMessageCommand {
-		value: ReceiveMessageCommandOutput;
+	ReceiveMessageCommand: class {
+		input: ReceiveMessageCommandOutput;
 		constructor(input: ReceiveMessageCommandInput) {
 			if (!input.QueueUrl) throw new Error('QueueUrl is required');
 
-			this.value = {
+			this.input = {
 				$metadata: {},
 				Messages: queues[input.QueueUrl],
 			};
@@ -622,31 +556,29 @@ const { privateKey, publicKey } = generateKeyPairSync('rsa', {
 });
 
 vi.mock('@aws-sdk/client-kms', () => ({
-	KMSClient: class KMSClient {
-		send: <T>(command: { value: T }) => Promise<T> = async (command) => {
-			return command.value;
-		};
+	KMSClient: class {
+		send: KMSClient['send'] = async (command) => command.input;
 	},
 
-	SignCommand: class SignCommand {
-		value: SignCommandOutput;
+	SignCommand: class {
+		input: SignCommandOutput;
 		constructor({ KeyId, Message }: SignCommandInput) {
 			if (!KeyId) throw new Error('KeyId is required');
 			if (!Message) throw new Error('Message is required');
 
-			this.value = {
+			this.input = {
 				$metadata: {},
 				Signature: sign('sha256', Message, { key: privateKey }),
 			};
 		}
 	},
 
-	GetPublicKeyCommand: class GetPublicKeyCommand {
-		value: GetPublicKeyCommandOutput;
+	GetPublicKeyCommand: class {
+		input: GetPublicKeyCommandOutput;
 		constructor({ KeyId }: GetPublicKeyCommandInput) {
 			if (!KeyId) throw new Error('KeyId is required');
 
-			this.value = {
+			this.input = {
 				$metadata: {},
 				PublicKey: Buffer.from(
 					publicKey

@@ -1,4 +1,4 @@
-import { cleanResources, getTopicMessages, createTable } from './mock';
+import { createTable, getTopicMessages, clearResources } from './mock';
 import { beforeEach, describe, expect, test } from 'vitest';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { PutCommand, GetCommand, BatchGetCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
@@ -15,11 +15,10 @@ const snsClient = new SNSClient();
 const sqsClient = new SQSClient();
 const kmsClient = new KMSClient();
 
+createTable('TableName', { primaryIndex: { hashKey: 'pk', rangeKey: 'sk' } });
+
 describe('DynamoDB', () => {
-	beforeEach(() => {
-		cleanResources();
-		createTable('TableName', { primaryIndex: { hashKey: 'pk', rangeKey: 'sk' } });
-	});
+	beforeEach(() => clearResources());
 
 	test('PutCommand && GetCommand', async () => {
 		await client.send(
@@ -105,9 +104,6 @@ describe('DynamoDB', () => {
 
 	describe('QueryCommand', () => {
 		beforeEach(() => {
-			cleanResources();
-			createTable('TableName', { primaryIndex: { hashKey: 'pk', rangeKey: 'sk' } });
-
 			client.send(
 				new PutCommand({
 					TableName: 'TableName',
@@ -179,9 +175,7 @@ describe('DynamoDB', () => {
 });
 
 describe('S3', () => {
-	beforeEach(() => {
-		cleanResources();
-	});
+	beforeEach(() => clearResources());
 
 	test('PutObjectCommand && GetObjectCommand', async () => {
 		await s3Client.send(
@@ -232,9 +226,7 @@ describe('S3', () => {
 });
 
 describe('SNS', () => {
-	beforeEach(() => {
-		cleanResources();
-	});
+	beforeEach(() => clearResources());
 
 	test('PublishCommand & check if message gets to topic', async () => {
 		const message = { foo: 'bar' };
@@ -254,9 +246,7 @@ describe('SNS', () => {
 });
 
 describe('SQS', () => {
-	beforeEach(() => {
-		cleanResources();
-	});
+	beforeEach(() => clearResources());
 
 	test('SendMessageCommand && ReceiveMessageCommand', async () => {
 		const messageBody = { foo: 'bar' };
@@ -287,6 +277,8 @@ describe('SQS', () => {
 });
 
 describe('KMS', () => {
+	beforeEach(() => clearResources());
+
 	test('SignCommand && GetPublicKeyCommand', async () => {
 		const payload = {
 			foo: 'bar',
