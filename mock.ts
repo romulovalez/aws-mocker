@@ -30,7 +30,6 @@ import type {
 	PutObjectCommandInput,
 	PutObjectCommandOutput,
 } from '@aws-sdk/client-s3';
-import type { StreamingBlobPayloadOutputTypes } from '@smithy/types';
 import type {
 	SNSClient,
 	PublishBatchCommandInput,
@@ -55,7 +54,8 @@ import type {
 	SignCommandInput,
 	SignCommandOutput,
 } from '@aws-sdk/client-kms';
-import { createHash, generateKeyPairSync, randomUUID, sign } from 'crypto';
+import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
+import { Readable } from 'node:stream';
 
 /**
  * MARK: memory storage
@@ -383,14 +383,19 @@ vi.mock('@aws-sdk/client-s3', () => ({
 
 			if (!file) throw new Error(`UNEXPECTED_FILE_FORMAT`);
 
+			const Body: Readable & {
+				transformToByteArray?: () => Promise<Uint8Array>;
+				transformToString?: () => Promise<string>;
+				transformToWebStream?: () => ReadableStream;
+			} = Readable.from([file.Body]);
+
+			Body.transformToByteArray = async (): Promise<Uint8Array> => Buffer.from(file.Body);
+			Body.transformToString = async (): Promise<string> => file.Body;
+			Body.transformToWebStream = (): ReadableStream => new Blob([file.Body]).stream();
+
 			this.input = {
 				$metadata: {},
-				Body: {
-					transformToByteArray: async (): Promise<Uint8Array> => Buffer.from(file.Body),
-					transformToString: async (): Promise<string> => file.Body,
-					transformToWebStream: (): ReadableStream => new Blob([file.Body]).stream(),
-					// TODO: there are some inconsistencies in the transformToWebStream method, check it
-				} as StreamingBlobPayloadOutputTypes,
+				Body: Body as GetObjectCommandOutput['Body'],
 			};
 		}
 	},
