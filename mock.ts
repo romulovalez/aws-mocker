@@ -11,6 +11,8 @@ import type {
 	BatchGetCommandOutput,
 	BatchWriteCommandInput,
 	BatchWriteCommandOutput,
+	DeleteCommandInput,
+	DeleteCommandOutput,
 	GetCommandInput,
 	GetCommandOutput,
 	NativeAttributeValue,
@@ -56,19 +58,15 @@ import type {
 } from '@aws-sdk/client-kms';
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { Readable } from 'node:stream';
+import { DynamoDBStreamEvent, SQSEvent } from 'aws-lambda';
+import { marshall } from '@aws-sdk/util-dynamodb';
 
 /**
  * MARK: memory storage
  */
 const tables: Record<string, NativeAttributeValue[]> = {};
 
-const tablesDefinitions: Record<
-	string,
-	{
-		KeySchema: Record<string, KeyType>;
-		GlobalSecondaryIndexes?: Record<string, Record<string, KeyType>>;
-	}
-> = {};
+const tablesDefinitions: Record<string, { KeySchema: Record<string, KeyType> }> = {};
 
 let buckets: Record<string, { Key: string; Body: string }[]> = {};
 
@@ -78,16 +76,22 @@ type QueueMessage = SendMessageBatchRequestEntry | SendMessageCommandInput;
 
 const queues: Record<string, QueueMessage[]> = {};
 
-export function internal_DynamoDBPutCommand({ TableName, Item }: PutCommandInput): PutCommandOutput {
+function findTableItemIndex(tableName: string, Item: NativeAttributeValue) {
+	if (!tables[tableName]) throw new Error(`Table '${tableName}' not found, create it first with createTable()`);
+
+	const KeySchema = tablesDefinitions[tableName]?.KeySchema;
+	if (!KeySchema) throw new Error(`Table '${tableName}' not found, create it first with createTable()`);
+
+	const keys = Object.keys(KeySchema);
+	return tables[tableName]?.findIndex((item) => keys.every((key) => item[key] === Item[key]));
+}
+
+function putCommand({ TableName, Item }: PutCommandInput): PutCommandOutput {
 	if (!TableName) throw new Error('TableName is required');
 	if (!Item) throw new Error('Item is required');
 	if (!tables[TableName]) throw new Error(`Table '${TableName}' not found, create it first with createTable()`);
 
-	const KeySchema = tablesDefinitions[TableName]?.KeySchema;
-	if (!KeySchema) throw new Error(`Table '${TableName}' not found, create it first with createTable()`);
-
-	const keys = Object.keys(KeySchema);
-	const indexFound = tables[TableName].findIndex((item) => keys.every((key) => item[key] === Item[key]));
+	const indexFound = findTableItemIndex(TableName, Item);
 	if (indexFound === -1) {
 		tables[TableName].push(Item);
 	} else {
@@ -111,50 +115,6 @@ function validateTableKeySchema(TableName: string, Key: Record<string, string | 
 /**
  * MARK: Helpers
  */
-export function clearResources() {
-	for (const table in tables) {
-		tables[table] = [];
-	}
-
-	buckets = {};
-	topics = {};
-
-	for (const queue in queues) {
-		// Don't override the array with an empty one or we can lose the proxy attached to the array,
-		// instead pop every element without mutating the array
-		while (queues[queue]!.length > 0) {
-			queues[queue]!.pop();
-		}
-	}
-}
-
-export function subscribeToQueue(queueUrl: string, subscriber: (MessageBody: string) => void) {
-	queues[queueUrl] = new Proxy(queues[queueUrl] ?? [], {
-		get(target, prop) {
-			if (prop === 'push') {
-				return (...args: QueueMessage[]) => {
-					for (const arg of args) {
-						if (!arg.MessageBody) throw new Error(`MessageBody is required, queue: '${queueUrl}`);
-						subscriber(arg.MessageBody);
-					}
-
-					return target[prop](...args);
-				};
-			}
-
-			return target[prop as keyof QueueMessage[]];
-		},
-	});
-}
-
-export function getTopicMessages(topicArn: string) {
-	return topics[topicArn]?.map((m) => JSON.parse(m.Message!)) ?? [];
-}
-
-export function getQueueMessages(queueUrl: string) {
-	return queues[queueUrl]?.map((m) => JSON.parse(m.MessageBody!)) ?? [];
-}
-
 export async function createTable(name: string, options: { primaryIndex: { hashKey: string; rangeKey?: string } }) {
 	const primaryIndex = Object.entries(options.primaryIndex);
 	await new DynamoDBClient().send(
@@ -168,6 +128,116 @@ export async function createTable(name: string, options: { primaryIndex: { hashK
 			})),
 		}),
 	);
+}
+
+export function getTopicMessages(topicArn: string) {
+	return topics[topicArn]?.map((m) => JSON.parse(m.Message!)) ?? [];
+}
+
+export function getQueueMessages(queueUrl: string) {
+	return queues[queueUrl]?.map((m) => JSON.parse(m.MessageBody!)) ?? [];
+}
+
+export function subscribeToQueue(queueUrl: string, subscriber: (event: SQSEvent) => void) {
+	queues[queueUrl] = new Proxy(queues[queueUrl] ?? [], {
+		get(target, prop, receiver) {
+			if (prop === 'push') {
+				return (...args: QueueMessage[]) => {
+					for (const arg of args) {
+						if (!arg.MessageBody) throw new Error(`MessageBody is required, queue: '${queueUrl}`);
+						subscriber({ Records: [{ body: arg.MessageBody }] } as SQSEvent);
+					}
+
+					target.push(...args);
+				};
+			}
+
+			return Reflect.get(target, prop, receiver);
+		},
+	});
+}
+
+export function subscribeToTable(tableName: string, subscriber: (event: DynamoDBStreamEvent) => void) {
+	tables[tableName] = new Proxy(tables[tableName] ?? [], {
+		get(target, prop, receiver) {
+			if (prop === 'push') {
+				return (...args: NativeAttributeValue[]) => {
+					subscriber({
+						Records: args.map((arg) => ({
+							eventID: randomUUID(),
+							eventName: 'INSERT',
+							dynamodb: {
+								NewImage: marshall(arg, { removeUndefinedValues: true }),
+								StreamViewType: 'NEW_IMAGE',
+							},
+						})),
+					});
+
+					target.push(...args);
+				};
+			}
+
+			if (prop === 'splice') {
+				return (start: number, deleteCount?: number) => {
+					subscriber({
+						Records: [
+							{
+								eventID: randomUUID(),
+								eventName: 'REMOVE',
+								dynamodb: {
+									OldImage: marshall(tables[tableName]![start], { removeUndefinedValues: true }),
+									StreamViewType: 'OLD_IMAGE',
+								},
+							},
+						],
+					});
+
+					target.splice(start, deleteCount);
+				};
+			}
+
+			return Reflect.get(target, prop, receiver);
+		},
+		set(target, prop, value, receiver) {
+			if (!isNaN(Number(prop))) {
+				subscriber({
+					Records: [
+						{
+							eventID: randomUUID(),
+							eventName: 'MODIFY',
+							dynamodb: {
+								OldImage: marshall(target[Number(prop)], { removeUndefinedValues: true }),
+								NewImage: marshall(value, { removeUndefinedValues: true }),
+								StreamViewType: 'NEW_AND_OLD_IMAGES',
+							},
+						},
+					],
+				});
+			}
+
+			return Reflect.set(target, prop, value, receiver);
+		},
+	});
+}
+
+// Don't override any arrays with an empty one or we can lose the possible proxy attached,
+// instead pop every element without mutating the array
+export function clearResources() {
+	for (const table in tables) {
+		while (tables[table]!.length > 0) {
+			tables[table]!.pop();
+		}
+	}
+
+	buckets = {};
+
+	topics = {};
+
+	for (const queue in queues) {
+		while (queues[queue]!.length > 0) {
+			queues[queue]!.pop();
+		}
+	}
 }
 
 /**
@@ -212,7 +282,7 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
 	PutCommand: class {
 		input: PutCommandOutput;
 		constructor(command: PutCommandInput) {
-			this.input = internal_DynamoDBPutCommand(command);
+			this.input = putCommand(command);
 		}
 	},
 
@@ -224,10 +294,7 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
 
 			validateTableKeySchema(TableName, Key);
 
-			const keys = Object.keys(Key);
-			const result = tables[TableName]?.find((item) => keys.every((key) => item[key] === Key[key]));
-
-			this.input = { $metadata: {}, Item: result };
+			this.input = { $metadata: {}, Item: tables[TableName]?.[findTableItemIndex(TableName, Key)] };
 		}
 	},
 
@@ -263,7 +330,7 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
 			const Items = RequestItems[TableName]?.map(({ PutRequest }) => PutRequest?.Item);
 			if (!Items) throw new Error('RequestItems Items is required');
 
-			Items.forEach((Item) => internal_DynamoDBPutCommand({ TableName, Item }));
+			Items.forEach((Item) => putCommand({ TableName, Item }));
 
 			this.input = { $metadata: {} };
 		}
@@ -274,6 +341,7 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
 		constructor(input: QueryCommandInput) {
 			if (!input.TableName) throw new Error('TableName is required');
 			if (!input.KeyConditionExpression) throw new Error('KeyConditionExpression is required');
+			if (input.FilterExpression) throw new Error('TEST MOCK ERROR: FilterExpression is not supported yet');
 
 			/**
 			 * This are the possible values for KeyConditionExpression:
@@ -286,37 +354,33 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
 			const [firstCondition, ...secondConditionSplitted] = input.KeyConditionExpression.split(' and ');
 			const secondCondition = secondConditionSplitted.join(' and ');
 
-			const conditions: {
-				attributeName: string;
-				operator: string | undefined;
-				attributeValue: NativeAttributeValue;
-			}[] = [];
-
-			for (const condition of [firstCondition, secondCondition]) {
-				if (!condition) continue;
-				const [key, operator, firstValue, _and, secondValue] = condition.split(' ');
-
-				const attributeName = key!.startsWith('#') ? input.ExpressionAttributeNames?.[key!] : key;
-				if (!attributeName) throw new Error(`Attribute '${key}' not found in ExpressionAttributeNames`);
-
-				const attributeValue =
-					operator === 'between' && secondValue
-						? [firstValue, secondValue].map((value) => input.ExpressionAttributeValues?.[value!])
-						: input.ExpressionAttributeValues?.[firstValue!];
-
-				conditions.push({ attributeName, operator, attributeValue });
-			}
-
 			const result = tables[input.TableName]?.filter((item) =>
-				conditions.every(({ attributeName, operator, attributeValue }) => {
-					if (operator === '=') return item[attributeName] === attributeValue;
-					if (operator === '<=') return item[attributeName] <= attributeValue;
-					if (operator === '>=') return item[attributeName] >= attributeValue;
-					if (operator === 'between') {
-						const [firstValue, secondValue] = attributeValue as [NativeAttributeValue, NativeAttributeValue];
-						return item[attributeName] >= firstValue && item[attributeName] <= secondValue;
+				[firstCondition, secondCondition].every((condition) => {
+					if (!condition) return true;
+
+					const [nameKey, operator, firstValueKey, _and, secondValueKey] = condition.split(' ');
+
+					const name = nameKey!.startsWith('#') ? input.ExpressionAttributeNames?.[nameKey!] : nameKey;
+					if (!name) throw new Error(`Attribute '${nameKey}' not found in ExpressionAttributeNames`);
+
+					if (operator !== '=' && operator !== '<=' && operator !== '>=' && operator !== 'between') {
+						throw new Error(`Unsupported operator: ${operator}`);
 					}
-					throw new Error(`Unsupported operator: ${operator}`);
+
+					const firstValue = input.ExpressionAttributeValues?.[firstValueKey!];
+					if (firstValueKey && !firstValue) {
+						throw new Error(`Attribute '${firstValueKey}' not found in ExpressionAttributeValues`);
+					}
+
+					const secondValue = input.ExpressionAttributeValues?.[secondValueKey!];
+					if (secondValueKey && !secondValue) {
+						throw new Error(`Attribute '${secondValueKey}' not found in ExpressionAttributeValues`);
+					}
+
+					if (operator === '=') return item[name!] === firstValue;
+					if (operator === '<=') return item[name!] <= firstValue;
+					if (operator === '>=') return item[name!] >= firstValue;
+					if (operator === 'between') return item[name!] >= firstValue && item[name!] <= secondValue;
 				}),
 			);
 
@@ -333,10 +397,24 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
 		constructor({ TableName }: ScanCommandInput) {
 			if (!TableName) throw new Error('TableName is required');
 
-			this.input = {
-				$metadata: {},
-				Items: tables[TableName] ?? [],
-			};
+			this.input = { $metadata: {}, Items: tables[TableName] ?? [] };
+		}
+	},
+
+	DeleteCommand: class {
+		input: DeleteCommandOutput;
+		constructor({ TableName, Key }: DeleteCommandInput) {
+			if (!TableName) throw new Error('TableName is required');
+			if (!Key) throw new Error('Key is required');
+
+			validateTableKeySchema(TableName, Key);
+
+			const indexFound = findTableItemIndex(TableName, Key);
+			if (indexFound !== -1) {
+				tables[TableName]!.splice(indexFound!, 1);
+			}
+
+			this.input = { $metadata: {} };
 		}
 	},
 }));
@@ -393,10 +471,7 @@ vi.mock('@aws-sdk/client-s3', () => ({
 			Body.transformToString = async (): Promise<string> => file.Body;
 			Body.transformToWebStream = (): ReadableStream => new Blob([file.Body]).stream();
 
-			this.input = {
-				$metadata: {},
-				Body: Body as GetObjectCommandOutput['Body'],
-			};
+			this.input = { $metadata: {}, Body: Body as GetObjectCommandOutput['Body'] };
 		}
 	},
 
@@ -451,10 +526,7 @@ vi.mock('@aws-sdk/client-sns', () => ({
 				topics[input.TopicArn] = [input];
 			}
 
-			this.input = {
-				$metadata: {},
-				MessageId: randomUUID(),
-			};
+			this.input = { $metadata: {}, MessageId: randomUUID() };
 		}
 	},
 
@@ -525,10 +597,7 @@ vi.mock('@aws-sdk/client-sqs', () => ({
 				queues[input.QueueUrl] = [input];
 			}
 
-			this.input = {
-				$metadata: {},
-				MessageId: randomUUID(),
-			};
+			this.input = { $metadata: {}, MessageId: randomUUID() };
 		}
 	},
 
@@ -537,10 +606,7 @@ vi.mock('@aws-sdk/client-sqs', () => ({
 		constructor(input: ReceiveMessageCommandInput) {
 			if (!input.QueueUrl) throw new Error('QueueUrl is required');
 
-			this.input = {
-				$metadata: {},
-				Messages: queues[input.QueueUrl],
-			};
+			this.input = { $metadata: {}, Messages: queues[input.QueueUrl] };
 		}
 	},
 }));
@@ -571,10 +637,7 @@ vi.mock('@aws-sdk/client-kms', () => ({
 			if (!KeyId) throw new Error('KeyId is required');
 			if (!Message) throw new Error('Message is required');
 
-			this.input = {
-				$metadata: {},
-				Signature: sign('sha256', Message, { key: privateKey }),
-			};
+			this.input = { $metadata: {}, Signature: sign('sha256', Message, { key: privateKey }) };
 		}
 	},
 

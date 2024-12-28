@@ -1,13 +1,28 @@
-import { createTable, getTopicMessages, clearResources } from './mock';
+import {
+	createTable,
+	getTopicMessages,
+	clearResources,
+	subscribeToTable,
+	subscribeToQueue,
+	getQueueMessages,
+} from './mock';
 import { beforeEach, describe, expect, test } from 'vitest';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { PutCommand, GetCommand, BatchGetCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
+import {
+	PutCommand,
+	GetCommand,
+	BatchGetCommand,
+	QueryCommand,
+	DeleteCommand,
+	ScanCommand,
+} from '@aws-sdk/lib-dynamodb';
 import { CopyObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { GetPublicKeyCommand, KMSClient, SignCommand } from '@aws-sdk/client-kms';
 import { SNSClient, PublishCommand } from '@aws-sdk/client-sns';
 import { SQSClient, SendMessageCommand, ReceiveMessageCommand } from '@aws-sdk/client-sqs';
 import jwt, { JwtPayload } from 'jsonwebtoken';
 import base64url from 'base64url';
+import { DynamoDBStreamEvent, SQSEvent } from 'aws-lambda';
 
 const client = new DynamoDBClient();
 const s3Client = new S3Client();
@@ -335,3 +350,134 @@ async function verify(token: string) {
 function convertToPem(base64Key: string) {
 	return `-----BEGIN PUBLIC KEY-----\n${base64Key.match(/.{1,64}/g)!.join('\n')}\n-----END PUBLIC KEY-----`;
 }
+
+describe('subscribe to queue', () => {
+	beforeEach(() => clearResources());
+
+	test('ReceiveMessageCommand', async () => {
+		const messages: SQSEvent[] = [];
+		subscribeToQueue('QueueUrl', (message) => {
+			messages.push(message);
+		});
+
+		await sqsClient.send(
+			new SendMessageCommand({ QueueUrl: 'QueueUrl', MessageBody: JSON.stringify({ text: 'message1' }) }),
+		);
+		await sqsClient.send(
+			new SendMessageCommand({ QueueUrl: 'QueueUrl', MessageBody: JSON.stringify({ text: 'message2' }) }),
+		);
+
+		clearResources();
+
+		await sqsClient.send(
+			new SendMessageCommand({ QueueUrl: 'QueueUrl', MessageBody: JSON.stringify({ text: 'message3' }) }),
+		);
+		await sqsClient.send(
+			new SendMessageCommand({ QueueUrl: 'QueueUrl', MessageBody: JSON.stringify({ text: 'message4' }) }),
+		);
+
+		expect(messages).toStrictEqual([
+			{ Records: [{ body: '{"text":"message1"}' }] },
+			{ Records: [{ body: '{"text":"message2"}' }] },
+			{ Records: [{ body: '{"text":"message3"}' }] },
+			{ Records: [{ body: '{"text":"message4"}' }] },
+		]);
+
+		expect(getQueueMessages('QueueUrl')).toStrictEqual([{ text: 'message3' }, { text: 'message4' }]);
+	});
+});
+
+describe('subscribe to table', () => {
+	beforeEach(() => clearResources());
+
+	test('INSERT, MODIFY and REMOVE dynamo events', async () => {
+		const events: DynamoDBStreamEvent[] = [];
+		subscribeToTable('TableName', (event) => {
+			events.push(event);
+		});
+
+		await client.send(
+			new PutCommand({
+				TableName: 'TableName',
+				Item: { pk: 'item1', sk: 'sk' },
+			}),
+		);
+
+		await client.send(
+			new PutCommand({
+				TableName: 'TableName',
+				Item: { pk: 'item2', sk: 'sk' },
+			}),
+		);
+
+		await client.send(
+			new DeleteCommand({
+				TableName: 'TableName',
+				Key: { pk: 'item1', sk: 'sk' },
+			}),
+		);
+
+		await client.send(
+			new PutCommand({
+				TableName: 'TableName',
+				Item: { pk: 'item2', sk: 'sk', foo: 'bar' },
+			}),
+		);
+
+		const items = await client.send(new ScanCommand({ TableName: 'TableName' }));
+
+		expect(items.Items).toStrictEqual([{ pk: 'item2', sk: 'sk', foo: 'bar' }]);
+
+		expect(events).toStrictEqual([
+			{
+				Records: [
+					{
+						dynamodb: {
+							NewImage: { pk: { S: 'item1' }, sk: { S: 'sk' } },
+							StreamViewType: 'NEW_IMAGE',
+						},
+						eventID: expect.any(String),
+						eventName: 'INSERT',
+					},
+				],
+			},
+			{
+				Records: [
+					{
+						dynamodb: {
+							NewImage: { pk: { S: 'item2' }, sk: { S: 'sk' } },
+							StreamViewType: 'NEW_IMAGE',
+						},
+						eventID: expect.any(String),
+						eventName: 'INSERT',
+					},
+				],
+			},
+			{
+				Records: [
+					{
+						dynamodb: {
+							OldImage: { pk: { S: 'item1' }, sk: { S: 'sk' } },
+							StreamViewType: 'OLD_IMAGE',
+						},
+						eventID: expect.any(String),
+						eventName: 'REMOVE',
+					},
+				],
+			},
+			{
+				Records: [
+					{
+						dynamodb: {
+							OldImage: { pk: { S: 'item2' }, sk: { S: 'sk' } },
+							NewImage: { pk: { S: 'item2' }, sk: { S: 'sk' }, foo: { S: 'bar' } },
+							StreamViewType: 'NEW_AND_OLD_IMAGES',
+						},
+						eventID: expect.any(String),
+						eventName: 'MODIFY',
+					},
+				],
+			},
+		]);
+	});
+});
