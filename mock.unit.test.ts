@@ -139,9 +139,7 @@ describe('DynamoDB', () => {
 				new QueryCommand({
 					TableName: 'TableName',
 					KeyConditionExpression: 'pk = :pk',
-					ExpressionAttributeValues: {
-						':pk': 'item1',
-					},
+					ExpressionAttributeValues: { ':pk': 'item1' },
 				}),
 			);
 
@@ -154,9 +152,7 @@ describe('DynamoDB', () => {
 				new QueryCommand({
 					TableName: 'TableName',
 					KeyConditionExpression: 'sk = :sk',
-					ExpressionAttributeValues: {
-						':sk': 'sk2',
-					},
+					ExpressionAttributeValues: { ':sk': 'sk2' },
 				}),
 			);
 
@@ -247,10 +243,7 @@ describe('SNS', () => {
 		const message = { foo: 'bar' };
 
 		const publishResult = await snsClient.send(
-			new PublishCommand({
-				TopicArn: 'TopicArn',
-				Message: JSON.stringify(message),
-			}),
+			new PublishCommand({ TopicArn: 'TopicArn', Message: JSON.stringify(message) }),
 		);
 
 		expect(publishResult.MessageId).toBeDefined();
@@ -267,27 +260,16 @@ describe('SQS', () => {
 		const messageBody = { foo: 'bar' };
 
 		const sendMessageResult = await sqsClient.send(
-			new SendMessageCommand({
-				QueueUrl: 'QueueUrl',
-				MessageBody: JSON.stringify(messageBody),
-			}),
+			new SendMessageCommand({ QueueUrl: 'QueueUrl', MessageBody: JSON.stringify(messageBody) }),
 		);
 
 		expect(sendMessageResult.MessageId).toBeDefined();
 
 		const receiveMessageResult = await sqsClient.send(
-			new ReceiveMessageCommand({
-				QueueUrl: 'QueueUrl',
-				MaxNumberOfMessages: 1,
-			}),
+			new ReceiveMessageCommand({ QueueUrl: 'QueueUrl', MaxNumberOfMessages: 1 }),
 		);
 
-		expect(receiveMessageResult.Messages).toStrictEqual([
-			{
-				QueueUrl: 'QueueUrl',
-				MessageBody: JSON.stringify(messageBody),
-			},
-		]);
+		expect(receiveMessageResult.Messages).toStrictEqual([{ Body: JSON.stringify(messageBody) }]);
 	});
 });
 
@@ -312,10 +294,7 @@ describe('KMS', () => {
 });
 
 async function sign(payload: JwtPayload) {
-	const headers: jwt.JwtHeader = {
-		alg: 'RS256',
-		typ: 'JWT',
-	};
+	const headers: jwt.JwtHeader = { alg: 'RS256', typ: 'JWT' };
 
 	const headersHash = base64url(JSON.stringify(headers));
 	const payloadHash = base64url(JSON.stringify(payload));
@@ -336,11 +315,7 @@ async function buildSignature(message: string) {
 }
 
 async function verify(token: string) {
-	const getPublicKeyResponse = await kmsClient.send(
-		new GetPublicKeyCommand({
-			KeyId: 'KmsKeyIdValue',
-		}),
-	);
+	const getPublicKeyResponse = await kmsClient.send(new GetPublicKeyCommand({ KeyId: 'KmsKeyIdValue' }));
 	const publicKey = Buffer.from(getPublicKeyResponse.PublicKey!).toString('base64');
 	const pemPublicKey = convertToPem(publicKey);
 
@@ -396,33 +371,10 @@ describe('subscribe to table', () => {
 			events.push(event);
 		});
 
-		await client.send(
-			new PutCommand({
-				TableName: 'TableName',
-				Item: { pk: 'item1', sk: 'sk' },
-			}),
-		);
-
-		await client.send(
-			new PutCommand({
-				TableName: 'TableName',
-				Item: { pk: 'item2', sk: 'sk' },
-			}),
-		);
-
-		await client.send(
-			new DeleteCommand({
-				TableName: 'TableName',
-				Key: { pk: 'item1', sk: 'sk' },
-			}),
-		);
-
-		await client.send(
-			new PutCommand({
-				TableName: 'TableName',
-				Item: { pk: 'item2', sk: 'sk', foo: 'bar' },
-			}),
-		);
+		await client.send(new PutCommand({ TableName: 'TableName', Item: { pk: 'item1', sk: 'sk' } }));
+		await client.send(new PutCommand({ TableName: 'TableName', Item: { pk: 'item2', sk: 'sk' } }));
+		await client.send(new DeleteCommand({ TableName: 'TableName', Key: { pk: 'item1', sk: 'sk' } }));
+		await client.send(new PutCommand({ TableName: 'TableName', Item: { pk: 'item2', sk: 'sk', foo: 'bar' } }));
 
 		const items = await client.send(new ScanCommand({ TableName: 'TableName' }));
 

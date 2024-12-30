@@ -45,7 +45,6 @@ import type {
 	ReceiveMessageCommandOutput,
 	SendMessageBatchCommandInput,
 	SendMessageBatchCommandOutput,
-	SendMessageBatchRequestEntry,
 	SendMessageCommandInput,
 	SendMessageCommandOutput,
 } from '@aws-sdk/client-sqs';
@@ -62,31 +61,32 @@ import { DynamoDBStreamEvent, SQSEvent } from 'aws-lambda';
 import { marshall } from '@aws-sdk/util-dynamodb';
 
 /**
- * MARK: memory storage
+ * MARK: Memory store
  */
 const tables: Record<string, NativeAttributeValue[]> = {};
+const tablesKeys: Record<string, Record<string, KeyType>> = {};
+const buckets: Record<string, { Key: string; Body: string }[]> = {};
+const topics: Record<string, string[]> = {};
+const queues: Record<string, string[]> = {};
 
-const tablesDefinitions: Record<string, { KeySchema: Record<string, KeyType> }> = {};
+function validateTableKeySchema(TableName: string, Key: NativeAttributeValue) {
+	if (!tablesKeys[TableName]) throw new Error(`Table '${TableName}' not found, create it first with createTable()`);
+	if (!Key) throw new Error('Key is required');
 
-let buckets: Record<string, { Key: string; Body: string }[]> = {};
-
-let topics: Record<string, PublishCommandInput[]> = {};
-
-type QueueMessage = SendMessageBatchRequestEntry | SendMessageCommandInput;
-
-const queues: Record<string, QueueMessage[]> = {};
+	for (const key of Object.keys(Key)) {
+		if (!tablesKeys[TableName][key]) throw new Error(`Key '${key}' is not defined in table '${TableName}'`);
+	}
+}
 
 function findTableItemIndex(tableName: string, Item: NativeAttributeValue) {
 	if (!tables[tableName]) throw new Error(`Table '${tableName}' not found, create it first with createTable()`);
+	if (!tablesKeys[tableName]) throw new Error(`Table '${tableName}' not found, create it first with createTable()`);
 
-	const KeySchema = tablesDefinitions[tableName]?.KeySchema;
-	if (!KeySchema) throw new Error(`Table '${tableName}' not found, create it first with createTable()`);
-
-	const keys = Object.keys(KeySchema);
+	const keys = Object.keys(tablesKeys[tableName]);
 	return tables[tableName]?.findIndex((item) => keys.every((key) => item[key] === Item[key]));
 }
 
-function putCommand({ TableName, Item }: PutCommandInput): PutCommandOutput {
+function putTableItem({ TableName, Item }: PutCommandInput) {
 	if (!TableName) throw new Error('TableName is required');
 	if (!Item) throw new Error('Item is required');
 	if (!tables[TableName]) throw new Error(`Table '${TableName}' not found, create it first with createTable()`);
@@ -96,19 +96,6 @@ function putCommand({ TableName, Item }: PutCommandInput): PutCommandOutput {
 		tables[TableName].push(Item);
 	} else {
 		tables[TableName][indexFound] = Item;
-	}
-
-	return { $metadata: {} };
-}
-
-function validateTableKeySchema(TableName: string, Key: Record<string, string | number | boolean> | undefined) {
-	const KeySchema = tablesDefinitions[TableName]?.KeySchema;
-	if (!KeySchema) throw new Error(`Table '${TableName}' not found, create it first with createTable()`);
-	if (!Key) throw new Error('Key is required');
-
-	const keys = Object.keys(Key);
-	for (const key of keys) {
-		if (!KeySchema[key]) throw new Error(`Key '${key}' is not defined in table '${TableName}'`);
 	}
 }
 
@@ -120,8 +107,7 @@ export async function createTable(name: string, options: { primaryIndex: { hashK
 	await new DynamoDBClient().send(
 		new CreateTableCommand({
 			TableName: name,
-			// For now we don't need to define the attributes for mocking
-			AttributeDefinitions: [],
+			AttributeDefinitions: [], // For mocking we don't need to define the attributes
 			KeySchema: primaryIndex.map(([type, name]) => ({
 				AttributeName: name,
 				KeyType: type === 'hashKey' ? 'HASH' : 'RANGE',
@@ -131,24 +117,24 @@ export async function createTable(name: string, options: { primaryIndex: { hashK
 }
 
 export function getTopicMessages(topicArn: string) {
-	return topics[topicArn]?.map((m) => JSON.parse(m.Message!)) ?? [];
+	return topics[topicArn]?.map((message) => JSON.parse(message!)) ?? [];
 }
 
 export function getQueueMessages(queueUrl: string) {
-	return queues[queueUrl]?.map((m) => JSON.parse(m.MessageBody!)) ?? [];
+	return queues[queueUrl]?.map((message) => JSON.parse(message!)) ?? [];
 }
 
 export function subscribeToQueue(queueUrl: string, subscriber: (event: SQSEvent) => void) {
 	queues[queueUrl] = new Proxy(queues[queueUrl] ?? [], {
 		get(target, prop, receiver) {
 			if (prop === 'push') {
-				return (...args: QueueMessage[]) => {
-					for (const arg of args) {
-						if (!arg.MessageBody) throw new Error(`MessageBody is required, queue: '${queueUrl}`);
-						subscriber({ Records: [{ body: arg.MessageBody }] } as SQSEvent);
+				return (...messages: string[]) => {
+					for (const message of messages) {
+						if (!message) throw new Error(`MessageBody is required, queue: '${queueUrl}`);
+						subscriber({ Records: [{ body: message }] } as SQSEvent);
 					}
 
-					target.push(...args);
+					target.push(...messages);
 				};
 			}
 
@@ -161,19 +147,19 @@ export function subscribeToTable(tableName: string, subscriber: (event: DynamoDB
 	tables[tableName] = new Proxy(tables[tableName] ?? [], {
 		get(target, prop, receiver) {
 			if (prop === 'push') {
-				return (...args: NativeAttributeValue[]) => {
+				return (...items: NativeAttributeValue[]) => {
 					subscriber({
-						Records: args.map((arg) => ({
+						Records: items.map((item) => ({
 							eventID: randomUUID(),
 							eventName: 'INSERT',
 							dynamodb: {
-								NewImage: marshall(arg, { removeUndefinedValues: true }),
+								NewImage: marshall(item, { removeUndefinedValues: true }),
 								StreamViewType: 'NEW_IMAGE',
 							},
 						})),
 					});
 
-					target.push(...args);
+					target.push(...items);
 				};
 			}
 
@@ -223,21 +209,10 @@ export function subscribeToTable(tableName: string, subscriber: (event: DynamoDB
 // Don't override any arrays with an empty one or we can lose the possible proxy attached,
 // instead pop every element without mutating the array
 export function clearResources() {
-	for (const table in tables) {
-		while (tables[table]!.length > 0) {
-			tables[table]!.pop();
-		}
-	}
-
-	buckets = {};
-
-	topics = {};
-
-	for (const queue in queues) {
-		while (queues[queue]!.length > 0) {
-			queues[queue]!.pop();
-		}
-	}
+	for (const table in tables) while (tables[table]!.length > 0) tables[table]!.pop();
+	for (const bucket in buckets) while (buckets[bucket]!.length > 0) buckets[bucket]!.pop();
+	for (const topic in topics) while (topics[topic]!.length > 0) topics[topic]!.pop();
+	for (const queue in queues) while (queues[queue]!.length > 0) queues[queue]!.pop();
 }
 
 /**
@@ -253,18 +228,18 @@ vi.mock('@aws-sdk/client-dynamodb', () => ({
 	 */
 	CreateTableCommand: class {
 		input: CreateTableCommandOutput;
-		constructor(command: CreateTableCommandInput) {
-			if (!command.TableName) throw new Error('TableName is required');
-			if (!command.KeySchema) throw new Error('KeySchema is required');
+		constructor({ TableName, KeySchema }: CreateTableCommandInput) {
+			if (!TableName) throw new Error('TableName is required');
+			if (!KeySchema) throw new Error('KeySchema is required');
 
-			tables[command.TableName] = [];
-			tablesDefinitions[command.TableName] = { KeySchema: {} };
+			tables[TableName] = [];
+			tablesKeys[TableName] = {};
 
-			for (const key of command.KeySchema) {
-				if (key.KeyType == null) throw new Error('KeyType is required');
-				if (key.AttributeName == null) throw new Error('AttributeName is required');
+			for (const { KeyType, AttributeName } of KeySchema) {
+				if (KeyType == null) throw new Error('KeyType is required');
+				if (AttributeName == null) throw new Error('AttributeName is required');
 
-				tablesDefinitions[command.TableName]!.KeySchema[key.AttributeName] = key.KeyType;
+				tablesKeys[TableName]![AttributeName] = KeyType;
 			}
 
 			this.input = { $metadata: {} };
@@ -274,15 +249,15 @@ vi.mock('@aws-sdk/client-dynamodb', () => ({
 
 vi.mock('@aws-sdk/lib-dynamodb', () => ({
 	DynamoDBDocumentClient: {
-		from(client: DynamoDBClient) {
-			return client;
-		},
+		from: (client: DynamoDBClient) => client,
 	},
 
 	PutCommand: class {
 		input: PutCommandOutput;
 		constructor(command: PutCommandInput) {
-			this.input = putCommand(command);
+			putTableItem(command);
+
+			this.input = { $metadata: {} };
 		}
 	},
 
@@ -307,17 +282,19 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
 			const Keys = RequestItems[TableName]?.Keys;
 			if (!Keys) throw new Error('RequestItems Keys is required');
 
-			const result =
-				tables[TableName]?.filter((item) =>
-					Keys.some((Key) => {
-						validateTableKeySchema(TableName, Key);
+			this.input = {
+				$metadata: {},
+				Responses: {
+					[TableName]:
+						tables[TableName]?.filter((item) =>
+							Keys.some((Key) => {
+								validateTableKeySchema(TableName, Key);
 
-						const keys = Object.keys(Key);
-						return keys.every((key) => item[key] === Key[key]);
-					}),
-				) ?? [];
-
-			this.input = { $metadata: {}, Responses: { [TableName]: result } };
+								return Object.keys(Key).every((key) => item[key] === Key[key]);
+							}),
+						) ?? [],
+				},
+			};
 		}
 	},
 
@@ -330,7 +307,7 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
 			const Items = RequestItems[TableName]?.map(({ PutRequest }) => PutRequest?.Item);
 			if (!Items) throw new Error('RequestItems Items is required');
 
-			Items.forEach((Item) => putCommand({ TableName, Item }));
+			Items.forEach((Item) => putTableItem({ TableName, Item }));
 
 			this.input = { $metadata: {} };
 		}
@@ -429,21 +406,20 @@ vi.mock('@aws-sdk/client-s3', () => ({
 
 	PutObjectCommand: class {
 		input: PutObjectCommandOutput;
-		constructor({ Bucket, Key, Body }: PutObjectCommandInput) {
+		// TODO: We assert Body as string for simplicity, but it can be a lot of things
+		constructor({ Bucket, Key, Body }: PutObjectCommandInput & { Body: string }) {
 			if (!Bucket) throw new Error('Bucket is required');
 			if (!Key) throw new Error('Key is required');
 			if (!Body) throw new Error('Body is required');
 
-			const file = { Key, Body: Body as string };
-
 			if (!buckets[Bucket]) {
-				buckets[Bucket] = [file];
+				buckets[Bucket] = [{ Key, Body }];
 			} else {
 				const indexFound = buckets[Bucket].findIndex((item) => item.Key === Key);
 				if (indexFound === -1) {
-					buckets[Bucket].push(file);
+					buckets[Bucket].push({ Key, Body });
 				} else {
-					buckets[Bucket][indexFound] = file;
+					buckets[Bucket][indexFound] = { Key, Body };
 				}
 			}
 
@@ -458,7 +434,6 @@ vi.mock('@aws-sdk/client-s3', () => ({
 			if (!Key) throw new Error('Key is required');
 
 			const file = buckets[Bucket]?.find((item) => item.Key === Key);
-
 			if (!file) throw new Error(`UNEXPECTED_FILE_FORMAT`);
 
 			const Body: Readable & {
@@ -467,9 +442,9 @@ vi.mock('@aws-sdk/client-s3', () => ({
 				transformToWebStream?: () => ReadableStream;
 			} = Readable.from([file.Body]);
 
-			Body.transformToByteArray = async (): Promise<Uint8Array> => Buffer.from(file.Body);
-			Body.transformToString = async (): Promise<string> => file.Body;
-			Body.transformToWebStream = (): ReadableStream => new Blob([file.Body]).stream();
+			Body.transformToByteArray = async () => Buffer.from(file.Body);
+			Body.transformToString = async () => file.Body;
+			Body.transformToWebStream = () => new Blob([file.Body]).stream();
 
 			this.input = { $metadata: {}, Body: Body as GetObjectCommandOutput['Body'] };
 		}
@@ -484,20 +459,18 @@ vi.mock('@aws-sdk/client-s3', () => ({
 
 			const [sourceBucket, ...sourceKeySplittedBySlashes] = CopySource.split('/');
 			const sourceKey = sourceKeySplittedBySlashes.join('/');
-			const file = buckets[sourceBucket!]?.find((item) => item.Key === sourceKey);
 
+			const file = buckets[sourceBucket!]?.find((item) => item.Key === sourceKey);
 			if (!file) throw new Error(`UNEXPECTED_FILE_FORMAT`);
 
-			const newFile = { Key, Body: file.Body };
-
 			if (!buckets[Bucket]) {
-				buckets[Bucket] = [newFile];
+				buckets[Bucket] = [{ Key, Body: file.Body }];
 			} else {
 				const indexFound = buckets[Bucket].findIndex((item) => item.Key === Key);
 				if (indexFound === -1) {
-					buckets[Bucket].push(newFile);
+					buckets[Bucket].push({ Key, Body: file.Body });
 				} else {
-					buckets[Bucket][indexFound] = newFile;
+					buckets[Bucket][indexFound] = { Key, Body: file.Body };
 				}
 			}
 
@@ -516,14 +489,14 @@ vi.mock('@aws-sdk/client-sns', () => ({
 
 	PublishCommand: class {
 		input: PublishCommandOutput;
-		constructor(input: PublishCommandInput) {
-			if (!input.Message) throw new Error('Message is required');
-			if (!input.TopicArn) throw new Error('TopicArn is required');
+		constructor({ TopicArn, Message }: PublishCommandInput) {
+			if (!Message) throw new Error('Message is required');
+			if (!TopicArn) throw new Error('TopicArn is required');
 
-			if (topics[input.TopicArn]) {
-				topics[input.TopicArn]!.push(input);
+			if (topics[TopicArn]) {
+				topics[TopicArn]!.push(Message);
 			} else {
-				topics[input.TopicArn] = [input];
+				topics[TopicArn] = [Message];
 			}
 
 			this.input = { $metadata: {}, MessageId: randomUUID() };
@@ -537,17 +510,14 @@ vi.mock('@aws-sdk/client-sns', () => ({
 			if (!PublishBatchRequestEntries) throw new Error('PublishBatchRequestEntries is required');
 
 			if (topics[TopicArn]) {
-				topics[TopicArn]!.push(...PublishBatchRequestEntries);
+				topics[TopicArn].push(...PublishBatchRequestEntries.map(({ Message }) => Message!));
 			} else {
-				topics[TopicArn] = PublishBatchRequestEntries;
+				topics[TopicArn] = PublishBatchRequestEntries.map(({ Message }) => Message!);
 			}
 
 			this.input = {
 				$metadata: {},
-				Successful: PublishBatchRequestEntries.map((entry) => ({
-					Id: entry.Id,
-					MessageId: randomUUID(),
-				})),
+				Successful: PublishBatchRequestEntries.map(({ Id }) => ({ Id, MessageId: randomUUID() })),
 			};
 		}
 	},
@@ -563,23 +533,23 @@ vi.mock('@aws-sdk/client-sqs', () => ({
 
 	SendMessageBatchCommand: class {
 		input: SendMessageBatchCommandOutput;
-		constructor(input: SendMessageBatchCommandInput) {
-			if (!input.QueueUrl) throw new Error('QueueUrl is required');
-			if (!input.Entries) throw new Error('Entries is required');
+		constructor({ QueueUrl, Entries }: SendMessageBatchCommandInput) {
+			if (!QueueUrl) throw new Error('QueueUrl is required');
+			if (!Entries) throw new Error('Entries is required');
 
-			if (queues[input.QueueUrl]) {
-				queues[input.QueueUrl]!.push(...input.Entries);
+			if (queues[QueueUrl]) {
+				queues[QueueUrl]!.push(...Entries.map(({ MessageBody }) => MessageBody!));
 			} else {
-				queues[input.QueueUrl] = input.Entries;
+				queues[QueueUrl] = Entries.map(({ MessageBody }) => MessageBody!);
 			}
 
 			this.input = {
 				$metadata: {},
 				Failed: [],
-				Successful: input.Entries.map((entry) => ({
-					Id: entry.Id,
-					MessageId: entry.Id,
-					MD5OfMessageBody: createHash('md5').update(Buffer.from(entry.MessageBody!)).digest('hex'),
+				Successful: Entries.map(({ Id, MessageBody }) => ({
+					Id,
+					MessageId: Id,
+					MD5OfMessageBody: createHash('md5').update(Buffer.from(MessageBody!)).digest('hex'),
 				})),
 			};
 		}
@@ -587,14 +557,14 @@ vi.mock('@aws-sdk/client-sqs', () => ({
 
 	SendMessageCommand: class {
 		input: SendMessageCommandOutput;
-		constructor(input: SendMessageCommandInput) {
-			if (!input.QueueUrl) throw new Error('QueueUrl is required');
-			if (!input.MessageBody) throw new Error('MessageBody is required');
+		constructor({ QueueUrl, MessageBody }: SendMessageCommandInput) {
+			if (!QueueUrl) throw new Error('QueueUrl is required');
+			if (!MessageBody) throw new Error('MessageBody is required');
 
-			if (queues[input.QueueUrl]) {
-				queues[input.QueueUrl]!.push(input);
+			if (queues[QueueUrl]) {
+				queues[QueueUrl]!.push(MessageBody);
 			} else {
-				queues[input.QueueUrl] = [input];
+				queues[QueueUrl] = [MessageBody];
 			}
 
 			this.input = { $metadata: {}, MessageId: randomUUID() };
@@ -603,10 +573,10 @@ vi.mock('@aws-sdk/client-sqs', () => ({
 
 	ReceiveMessageCommand: class {
 		input: ReceiveMessageCommandOutput;
-		constructor(input: ReceiveMessageCommandInput) {
-			if (!input.QueueUrl) throw new Error('QueueUrl is required');
+		constructor({ QueueUrl }: ReceiveMessageCommandInput) {
+			if (!QueueUrl) throw new Error('QueueUrl is required');
 
-			this.input = { $metadata: {}, Messages: queues[input.QueueUrl] };
+			this.input = { $metadata: {}, Messages: queues[QueueUrl]?.map((Body) => ({ Body })) ?? [] };
 		}
 	},
 }));
@@ -616,14 +586,8 @@ vi.mock('@aws-sdk/client-sqs', () => ({
  */
 const { privateKey, publicKey } = generateKeyPairSync('rsa', {
 	modulusLength: 2048,
-	publicKeyEncoding: {
-		type: 'spki',
-		format: 'pem',
-	},
-	privateKeyEncoding: {
-		type: 'pkcs1',
-		format: 'pem',
-	},
+	publicKeyEncoding: { type: 'spki', format: 'pem' },
+	privateKeyEncoding: { type: 'pkcs1', format: 'pem' },
 });
 
 vi.mock('@aws-sdk/client-kms', () => ({
