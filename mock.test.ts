@@ -15,6 +15,7 @@ import {
 	QueryCommand,
 	DeleteCommand,
 	ScanCommand,
+	DynamoDBDocumentClient,
 } from '@aws-sdk/lib-dynamodb';
 import { CopyObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { GetPublicKeyCommand, KMSClient, SignCommand } from '@aws-sdk/client-kms';
@@ -24,7 +25,7 @@ import jwt, { JwtPayload } from 'jsonwebtoken';
 import base64url from 'base64url';
 import { DynamoDBStreamEvent, SQSEvent } from 'aws-lambda';
 
-const client = new DynamoDBClient();
+const ddbClient = DynamoDBDocumentClient.from(new DynamoDBClient());
 const s3Client = new S3Client();
 const snsClient = new SNSClient();
 const sqsClient = new SQSClient();
@@ -36,14 +37,14 @@ describe('DynamoDB', () => {
 	beforeEach(() => clearResources());
 
 	test('PutCommand && GetCommand', async () => {
-		await client.send(
+		await ddbClient.send(
 			new PutCommand({
 				TableName: 'TableName',
 				Item: { pk: 'item1', sk: 'sk' },
 			}),
 		);
 
-		const shouldItemExist = await client.send(
+		const shouldItemExist = await ddbClient.send(
 			new GetCommand({
 				TableName: 'TableName',
 				Key: { pk: 'item1', sk: 'sk' },
@@ -52,14 +53,14 @@ describe('DynamoDB', () => {
 
 		expect(shouldItemExist.Item).toStrictEqual({ pk: 'item1', sk: 'sk' });
 
-		await client.send(
+		await ddbClient.send(
 			new PutCommand({
 				TableName: 'TableName',
 				Item: { pk: 'item1', sk: 'sk', foo: 'bar' },
 			}),
 		);
 
-		const shouldItemOverride = await client.send(
+		const shouldItemOverride = await ddbClient.send(
 			new GetCommand({
 				TableName: 'TableName',
 				Key: { pk: 'item1', sk: 'sk' },
@@ -74,14 +75,14 @@ describe('DynamoDB', () => {
 	});
 
 	test('GetBatchCommand', async () => {
-		await client.send(
+		await ddbClient.send(
 			new PutCommand({
 				TableName: 'TableName',
 				Item: { pk: 'item1', sk: 'sk' },
 			}),
 		);
 
-		const oneItem = await client.send(
+		const oneItem = await ddbClient.send(
 			new BatchGetCommand({
 				RequestItems: {
 					['TableName']: {
@@ -95,14 +96,14 @@ describe('DynamoDB', () => {
 			['TableName']: [{ pk: 'item1', sk: 'sk' }],
 		});
 
-		await client.send(
+		await ddbClient.send(
 			new PutCommand({
 				TableName: 'TableName',
 				Item: { pk: 'item1', sk: 'sk', foo: 'bar' },
 			}),
 		);
 
-		const stillOneItem = await client.send(
+		const stillOneItem = await ddbClient.send(
 			new BatchGetCommand({
 				RequestItems: {
 					['TableName']: {
@@ -119,14 +120,14 @@ describe('DynamoDB', () => {
 
 	describe('QueryCommand', () => {
 		beforeEach(() => {
-			client.send(
+			ddbClient.send(
 				new PutCommand({
 					TableName: 'TableName',
 					Item: { pk: 'item1', sk: 'sk1', merchantId: 'merchant1', confirmedAt: 1620000000 },
 				}),
 			);
 
-			client.send(
+			ddbClient.send(
 				new PutCommand({
 					TableName: 'TableName',
 					Item: { pk: 'item1', sk: 'sk2', merchantId: 'merchant1', confirmedAt: 1625000000 },
@@ -135,7 +136,7 @@ describe('DynamoDB', () => {
 		});
 
 		test('QueryCommand: simple case', async () => {
-			const multipleResults = await client.send(
+			const multipleResults = await ddbClient.send(
 				new QueryCommand({
 					TableName: 'TableName',
 					KeyConditionExpression: 'pk = :pk',
@@ -148,7 +149,7 @@ describe('DynamoDB', () => {
 				{ pk: 'item1', sk: 'sk2', merchantId: 'merchant1', confirmedAt: 1625000000 },
 			]);
 
-			const singleFilteredResult = await client.send(
+			const singleFilteredResult = await ddbClient.send(
 				new QueryCommand({
 					TableName: 'TableName',
 					KeyConditionExpression: 'sk = :sk',
@@ -162,7 +163,7 @@ describe('DynamoDB', () => {
 		});
 
 		test('QueryCommand: and / between cases', async () => {
-			const queryResultWithCondition = await client.send(
+			const queryResultWithCondition = await ddbClient.send(
 				new QueryCommand({
 					TableName: 'TableName',
 					KeyConditionExpression: '#merchantId = :merchantId and #confirmedAt between :from and :to',
@@ -371,12 +372,12 @@ describe('subscribe to table', () => {
 			events.push(event);
 		});
 
-		await client.send(new PutCommand({ TableName: 'TableName', Item: { pk: 'item1', sk: 'sk' } }));
-		await client.send(new PutCommand({ TableName: 'TableName', Item: { pk: 'item2', sk: 'sk' } }));
-		await client.send(new DeleteCommand({ TableName: 'TableName', Key: { pk: 'item1', sk: 'sk' } }));
-		await client.send(new PutCommand({ TableName: 'TableName', Item: { pk: 'item2', sk: 'sk', foo: 'bar' } }));
+		await ddbClient.send(new PutCommand({ TableName: 'TableName', Item: { pk: 'item1', sk: 'sk' } }));
+		await ddbClient.send(new PutCommand({ TableName: 'TableName', Item: { pk: 'item2', sk: 'sk' } }));
+		await ddbClient.send(new DeleteCommand({ TableName: 'TableName', Key: { pk: 'item1', sk: 'sk' } }));
+		await ddbClient.send(new PutCommand({ TableName: 'TableName', Item: { pk: 'item2', sk: 'sk', foo: 'bar' } }));
 
-		const items = await client.send(new ScanCommand({ TableName: 'TableName' }));
+		const items = await ddbClient.send(new ScanCommand({ TableName: 'TableName' }));
 
 		expect(items.Items).toStrictEqual([{ pk: 'item2', sk: 'sk', foo: 'bar' }]);
 
