@@ -57,7 +57,7 @@ import type {
 } from '@aws-sdk/client-kms';
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { Readable } from 'node:stream';
-import { DynamoDBStreamEvent, SQSEvent } from 'aws-lambda';
+import type { DynamoDBStreamEvent, SQSEvent } from 'aws-lambda';
 import { marshall } from '@aws-sdk/util-dynamodb';
 
 /**
@@ -116,11 +116,11 @@ export async function createTable(name: string, options: { primaryIndex: { hashK
 	);
 }
 
-export function getTopicMessages(topicArn: string) {
+export function getTopicMessages<T>(topicArn: string): T[] {
 	return topics[topicArn]?.map((message) => JSON.parse(message!)) ?? [];
 }
 
-export function getQueueMessages(queueUrl: string) {
+export function getQueueMessages<T>(queueUrl: string): T[] {
 	return queues[queueUrl]?.map((message) => JSON.parse(message!)) ?? [];
 }
 

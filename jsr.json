@@ -1,0 +1,9 @@
+{
+	"name": "@romu/aws-mocker",
+	"version": "1.6.1",
+	"license": "ISC",
+	"exports": "./mock.ts",
+	"imports": {
+		"aws-lambda": "npm:@types/aws-lambda@^8.10.145"
+	}
+}
