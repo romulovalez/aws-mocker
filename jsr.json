@@ -1,6 +1,6 @@
 {
 	"name": "@romu/aws-mocker",
-	"version": "1.6.1",
+	"version": "1.6.2",
 	"license": "ISC",
 	"exports": "./mock.ts",
 	"imports": {
