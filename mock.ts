@@ -328,7 +328,11 @@ vi.mock('@aws-sdk/lib-dynamodb', () => ({
 			 * e) #pk = :pk and #sk >= :sk
 			 * f) #pk = :pk and #sk between :from and :to
 			 */
-			const [firstCondition, ...secondConditionSplitted] = input.KeyConditionExpression.split(' and ');
+			const [firstCondition, ...secondConditionSplitted] = input.KeyConditionExpression.replaceAll('=', ' = ')
+				.replaceAll('  ', ' ')
+				.replaceAll(' AND ', ' and ')
+				.replaceAll(' BETWEEN ', ' between ')
+				.split(' and ');
 			const secondCondition = secondConditionSplitted.join(' and ');
 
 			const result = tables[input.TableName]?.filter((item) =>
